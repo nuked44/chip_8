@@ -2,11 +2,7 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 
-use crate::{
-    config::*,
-    inst::{hex_to_inst, Inst},
-    screen::Interface,
-};
+use crate::{config::*, screen::Interface};
 
 #[allow(dead_code)]
 pub struct Register {
@@ -131,53 +127,25 @@ impl<T: Interface> Chip<T> {
 
     pub fn run(&mut self) {
         self.running = true;
-
-        let mut last_key_update_time = Instant::now();
-        let mut last_instruction_run_time = Instant::now();
-        let mut last_display_time = Instant::now();
-        let mut last_timer_decrement = Instant::now();
+        let target_frame_time = Duration::from_millis(1 / SCREEN_REFRESH_RATE as u64);
 
         while self.running {
-            // let keys_pressed = self.interface.get_keys_pressed();
-            // let key = if !keys_pressed.is_empty() {
-            //     Some(keys_pressed[0])
-            // } else {
-            //     None
-            // };
+            let frame_start = Instant::now();
 
-            // Update keyboard when key is pressed or after 200ms
-            // let chip8_key = key;
-            // if chip8_key.is_some()
-            //     || Instant::now() - last_key_update_time
-            //         >= Duration::from_micros(100 * INSTRUCTION_TIMING)
-            // {
-            //     last_key_update_time = Instant::now();
-            //     self.keyboard = chip8_key;
-            // }
-
-            // Execute next instruction every 2ms
-            if Instant::now() - last_instruction_run_time
-                > Duration::from_micros(INSTRUCTION_TIMING)
-            {
-                last_instruction_run_time = Instant::now();
+            // Execute next instructions for frame
+            for _ in 0..(INSTRUCTION_FREQUENCY / SCREEN_REFRESH_RATE) {
                 self.execute_inst();
             }
 
-            // Update interface every 10ms
-            if Instant::now() - last_display_time > Duration::from_micros(5 * INSTRUCTION_TIMING) {
-                last_display_time = Instant::now();
-                self.interface.update_screen();
-            }
+            // Update Screen
+            self.interface.update_screen();
 
             // Update Sound and Delay timer
-            if Instant::now() - last_timer_decrement > Duration::from_micros(16666) {
-                if self.delay_timer > 0 {
-                    self.delay_timer -= 1;
-                }
-                if self.sound_timer > 0 {
-                    self.sound_timer -= 1;
-                }
-                last_timer_decrement = Instant::now();
+            self.delay_timer -= 1;
+            self.sound_timer -= 1;
+            let frame_duration = Instant::now() - frame_start;
+            if frame_duration > target_frame_time {
+                std::thread::sleep(target_frame_time - frame_duration);
             }
         }
     }
@@ -200,140 +168,174 @@ impl<T: Interface> Chip<T> {
         let val: u16 = 0
             | (((self.memory[self.pc as usize] as u16) << 8)
                 | self.memory[(self.pc + 1) as usize] as u16);
-        let inst: Inst = hex_to_inst(val);
-        match inst {
-            Inst::Empty => self.pc += 2,
-            Inst::Cls => {
-                self.interface.clear_screen();
-                self.pc += 2;
-            }
-            Inst::Ret => {
-                self.stackpointer -= 1;
-                self.pc = self.stack[self.stackpointer as usize];
-                self.pc += 2;
-            }
-            Inst::Jmp { addr } => {
-                self.pc = addr;
-            }
-            Inst::Call { addr } => {
+        let a: u16 = (val & 0xF000) >> 12;
+        let b: u16 = (val & 0x0F00) >> 8;
+        let c: u16 = (val & 0x00F0) >> 4;
+        let d: u16 = val & 0x000F;
+        match a {
+            0x0 => match (c << 4) | d {
+                // Cls, Clear the screen
+                0xE0 => {
+                    self.interface.clear_screen();
+                    self.pc += 2;
+                }
+                // Ret, Return from subroutine
+                0xEE => {
+                    self.stackpointer -= 1;
+                    self.pc = self.stack[self.stackpointer as usize];
+                    self.pc += 2;
+                }
+                // Empty, Does nothing
+                _ => self.pc += 2,
+            },
+            // Jmp, Jump to addr
+            0x1 => self.pc = b | c | d,
+            // Call, Call subroutine at addr
+            0x2 => {
                 self.stack[self.stackpointer as usize] = self.pc;
                 self.stackpointer += 1;
-                self.pc = addr;
+                self.pc = b | c | d;
             }
-            Inst::SV { vx, byte } => {
-                if self.registers.get_reg_v(vx) == byte {
+            // Skip next inst if value in vx == byte
+            0x3 => {
+                if self.registers.get_reg_v(b as u8) == (c | d) as u8 {
                     self.pc += 2;
                 }
                 self.pc += 2;
             }
-            Inst::SnV { vx, byte } => {
-                if self.registers.get_reg_v(vx) != byte {
+            // Skip next inst if value in vx != byte
+            0x4 => {
+                if self.registers.get_reg_v(b as u8) != (c | d) as u8 {
                     self.pc += 2;
                 }
                 self.pc += 2;
             }
-            Inst::SR { vx, vy } => {
-                if self.registers.get_reg_v(vx) == self.registers.get_reg_v(vy) {
+            // Skip if val in vx == val in vy
+            0x5 => {
+                if self.registers.get_reg_v(b as u8) == self.registers.get_reg_v(c as u8) {
                     self.pc += 2;
                 }
                 self.pc += 2;
             }
-            Inst::LdV { vx, byte } => {
-                self.registers.set_reg_v(vx, byte);
+            // Loads byte into vx
+            0x6 => {
+                self.registers.set_reg_v(b as u8, (c | d) as u8);
                 self.pc += 2;
             }
-            Inst::AddV { vx, byte } => {
-                let (res, _) = self.registers.get_reg_v(vx).overflowing_add(byte);
-                self.registers.set_reg_v(vx, res);
-                self.pc += 2;
-            }
-            Inst::LdR { vx, vy } => {
-                self.registers.set_reg_v(vx, self.registers.get_reg_v(vy));
-                self.pc += 2;
-            }
-            Inst::OrR { vx, vy } => {
-                let val = self.registers.get_reg_v(vx) | self.registers.get_reg_v(vy);
-                self.registers.set_reg_v(vx, val);
-                self.registers.set_reg_v(0xF, 0);
-                self.pc += 2;
-            }
-            Inst::AndR { vx, vy } => {
-                let val = self.registers.get_reg_v(vx) & self.registers.get_reg_v(vy);
-                self.registers.set_reg_v(vx, val);
-                self.registers.set_reg_v(0xF, 0);
-                self.pc += 2;
-            }
-            Inst::XorR { vx, vy } => {
-                let val = self.registers.get_reg_v(vx) ^ self.registers.get_reg_v(vy);
-                self.registers.set_reg_v(vx, val);
-                self.registers.set_reg_v(0xF, 0);
-                self.pc += 2;
-            }
-            Inst::AddR { vx, vy } => {
-                let (res, vf) = self
+            // Adds byte to vx
+            0x7 => {
+                let (res, _) = self
                     .registers
-                    .get_reg_v(vx)
-                    .overflowing_add(self.registers.get_reg_v(vy));
-                self.registers.set_reg_v(vx, res);
-                self.registers.set_reg_v(0xF, vf as u8);
+                    .get_reg_v((b >> 8) as u8)
+                    .overflowing_add((c | d) as u8);
+                self.registers.set_reg_v(b as u8, res);
                 self.pc += 2;
             }
-            Inst::SubR { vx, vy } => {
-                let (res, vf) = self
-                    .registers
-                    .get_reg_v(vx)
-                    .overflowing_sub(self.registers.get_reg_v(vy));
-                self.registers.set_reg_v(vx, res);
-                self.registers.set_reg_v(0xF, !vf as u8);
+            0x8 => match d {
+                // Loads val of vy in vx
+                0x0 => {
+                    self.registers
+                        .set_reg_v(b as u8, self.registers.get_reg_v(c as u8));
+                    self.pc += 2;
+                }
+                // Bitwise or of vx and vy, stores result in vx
+                0x1 => {
+                    let val = self.registers.get_reg_v(b as u8) | self.registers.get_reg_v(c as u8);
+                    self.registers.set_reg_v(b as u8, val);
+                    self.registers.set_reg_v(0xF, 0);
+                    self.pc += 2;
+                }
+                // Bitwise and of vx and vy, stores result in vx
+                0x2 => {
+                    let val = self.registers.get_reg_v(b as u8) & self.registers.get_reg_v(c as u8);
+                    self.registers.set_reg_v(b as u8, val);
+                    self.registers.set_reg_v(0xF, 0);
+                    self.pc += 2;
+                }
+                // Bitwise xor of vx and vy, stores result in vx
+                0x3 => {
+                    let val = self.registers.get_reg_v(b as u8) ^ self.registers.get_reg_v(c as u8);
+                    self.registers.set_reg_v(b as u8, val);
+                    self.registers.set_reg_v(0xF, 0);
+                    self.pc += 2;
+                }
+                // Add vx and vy, result stored in vx, if overflow (vx + vy >= 255) VF set to 1
+                0x4 => {
+                    let (res, vf) = self
+                        .registers
+                        .get_reg_v(b as u8)
+                        .overflowing_add(self.registers.get_reg_v(c as u8));
+                    self.registers.set_reg_v(b as u8, res);
+                    self.registers.set_reg_v(0xF, vf as u8);
+                    self.pc += 2;
+                }
+                // Subtract vy from vx, result stored in vx, if vx > vy VF set to 1, otherwise 0
+                0x5 => {
+                    let (res, vf) = self
+                        .registers
+                        .get_reg_v(b as u8)
+                        .overflowing_sub(self.registers.get_reg_v(c as u8));
+                    self.registers.set_reg_v(b as u8, res);
+                    self.registers.set_reg_v(0xF, !vf as u8);
+                    self.pc += 2;
+                }
+                // Shift vx right, VF set to least significant bit of vx
+                0x6 => {
+                    let val = self.registers.get_reg_v(c as u8);
+                    self.registers.set_reg_v(b as u8, val >> 1);
+                    self.registers.set_reg_v(0xF, val & 0x1);
+                    self.pc += 2;
+                }
+                // Subtract vx from vy, result stored in vx, if vy > vx VF set to 1, otherwise 0
+                0x7 => {
+                    let (res, vf) = self
+                        .registers
+                        .get_reg_v(c as u8)
+                        .overflowing_sub(self.registers.get_reg_v(b as u8));
+                    self.registers.set_reg_v(b as u8, res);
+                    self.registers.set_reg_v(0xF, !vf as u8);
+                    self.pc += 2;
+                }
+                // Shift vx left, VF set to most significant bit of vx
+                0xE => {
+                    let val = self.registers.get_reg_v(c as u8);
+                    self.registers.set_reg_v(b as u8, val << 1);
+                    self.registers.set_reg_v(0xF, (val >> 7) & 0x1);
+                    self.pc += 2;
+                }
+                _ => panic!("Illegal instruction {val}"),
+            },
+            // Skip if val in vx != val in vy
+            0x9 => {
                 self.pc += 2;
-            }
-            Inst::Shr { vx, vy } => {
-                let val = self.registers.get_reg_v(vy);
-                self.registers.set_reg_v(vx, val >> 1);
-                self.registers.set_reg_v(0xF, val & 0x1);
-                self.pc += 2;
-            }
-            Inst::SubnR { vx, vy } => {
-                let (res, vf) = self
-                    .registers
-                    .get_reg_v(vy)
-                    .overflowing_sub(self.registers.get_reg_v(vx));
-                self.registers.set_reg_v(vx, res);
-                self.registers.set_reg_v(0xF, !vf as u8);
-                self.pc += 2;
-            }
-            Inst::Shl { vx, vy } => {
-                let val = self.registers.get_reg_v(vy);
-                self.registers.set_reg_v(vx, val << 1);
-                self.registers.set_reg_v(0xF, (val >> 7) & 0x1);
-                self.pc += 2;
-            }
-            Inst::SnR { vx, vy } => {
-                self.pc += 2;
-                if self.registers.get_reg_v(vx) != self.registers.get_reg_v(vy) {
+                if self.registers.get_reg_v(b as u8) != self.registers.get_reg_v(c as u8) {
                     self.pc += 2;
                 }
             }
-            Inst::LdI { addr } => {
-                self.registers.i = addr;
+            // Load addr into register I
+            0xA => {
+                self.registers.i = b | c | d;
                 self.pc += 2;
             }
-            Inst::JpV0 { addr } => {
-                self.pc = addr + self.registers.get_reg_v(0x0) as u16;
+            // Jumps to addr + V0
+            0xB => {
+                self.pc = b | c | d + self.registers.get_reg_v(0x0) as u16;
             }
-            Inst::Rnd { vx, byte } => {
-                let val = (rand::thread_rng().gen_range(0..=255) as u8) & byte;
-                self.registers.set_reg_v(vx, val);
+            // Moves rnd value (0-255) & byte into vx
+            0xC => {
+                let val = (rand::thread_rng().gen_range(0..=255) as u8) & (c | d) as u8;
+                self.registers.set_reg_v(b as u8, val);
                 self.pc += 2;
             }
-            Inst::Disp { vx, vy, n } => {
+            // Display n-byte sprite starting at memory location I at (vx, vy), set VF = collision
+            0xD => {
                 let mut sprite_buffer: Vec<u8> = Vec::new();
-                for i in 0..n {
+                for i in 0..(d as u8) {
                     sprite_buffer.push(self.memory[(self.registers.i + i as u16) as usize]);
                 }
                 if self.interface.draw_sprite(
-                    self.registers.get_reg_v(vx),
-                    self.registers.get_reg_v(vy),
+                    self.registers.get_reg_v(b as u8),
+                    self.registers.get_reg_v(c as u8),
                     sprite_buffer,
                 ) {
                     self.registers.set_reg_v(0xF, 1);
@@ -342,79 +344,100 @@ impl<T: Interface> Chip<T> {
                 }
                 self.pc += 2;
             }
-            Inst::SKp { vx } => {
-                let target = self.registers.get_reg_v(vx);
-                if self.interface.get_key(target) {
-                    self.pc += 2;
-                }
-                self.pc += 2;
-            }
-            Inst::SKnp { vx } => {
-                let target = self.registers.get_reg_v(vx);
-                if !self.interface.get_key(target) {
-                    self.pc += 2;
-                }
-                self.pc += 2;
-            }
-            Inst::LdRDt { vx } => {
-                self.registers.set_reg_v(vx, self.delay_timer);
-                self.pc += 2;
-            }
-            Inst::LdRKp { vx } => {
-                if let Some(key) = self.release_key_wait {
-                    if !self.interface.get_key(key) {
-                        self.release_key_wait = None;
+
+            0xE => match (c >> 4) | d {
+                // Skip next instruction if key with the value of vx is pressed
+                0x9E => {
+                    let target = self.registers.get_reg_v(b as u8);
+                    if self.interface.get_key(target) {
                         self.pc += 2;
                     }
-                } else {
-                    if let Some(key) = self.keyboard {
-                        self.registers.set_reg_v(vx, key);
-                        self.release_key_wait = Some(key);
+                    self.pc += 2;
+                }
+                // Skip next instruction if key with the value of vx is not pressed
+                0xA1 => {
+                    let target = self.registers.get_reg_v(b as u8);
+                    if !self.interface.get_key(target) {
+                        self.pc += 2;
+                    }
+                    self.pc += 2;
+                }
+                _ => panic!("Illegal instruction {val}"),
+            },
+
+            0xF => match (c >> 4) | d {
+                // Set vx to delay timer val
+                0x07 => {
+                    self.registers.set_reg_v(b as u8, self.delay_timer);
+                    self.pc += 2;
+                }
+                // Wait for a key press, store the value of the key in vx
+                0x0A => {
+                    // TODO:
+                    if let Some(key) = self.release_key_wait {
+                        if !self.interface.get_key(key) {
+                            self.release_key_wait = None;
+                            self.pc += 2;
+                        }
+                    } else {
+                        if let Some(key) = self.keyboard {
+                            self.registers.set_reg_v(b as u8, key);
+                            self.release_key_wait = Some(key);
+                        }
                     }
                 }
-            }
-            Inst::LdDtR { vx } => {
-                self.delay_timer = self.registers.get_reg_v(vx);
-                self.pc += 2;
-            }
-            Inst::LdStR { vx } => {
-                self.sound_timer = self.registers.get_reg_v(vx);
-                self.pc += 2;
-            }
-            Inst::AddRI { vx } => {
-                let val = self.registers.i + self.registers.get_reg_v(vx) as u16;
-                self.registers.i = val;
-                self.pc += 2;
-            }
-            Inst::LdIF { vx } => {
-                let x = self.registers.get_reg_v(vx);
-                self.registers.i = (FONT_POS_START + 5 * x as usize) as u16;
-                self.pc += 2;
-            }
-            Inst::LdBCDR { vx } => {
-                let val = self.registers.get_reg_v(vx);
-                self.memory[self.registers.i as usize] = val / 100;
-                self.memory[(self.registers.i + 1) as usize] = (val % 100) / 10;
-                self.memory[(self.registers.i + 2) as usize] = (val % 100) % 10;
-                self.pc += 2;
-            }
-            Inst::LdIR { vx } => {
-                let i = self.registers.i;
-                for x in 0..=vx {
-                    self.memory[(i + x as u16) as usize] = self.registers.get_reg_v(x);
+                // Set delay timer value to vx
+                0x15 => {
+                    self.delay_timer = self.registers.get_reg_v(b as u8);
+                    self.pc += 2;
                 }
-                self.registers.i = i + vx as u16 + 1;
-                self.pc += 2;
-            }
-            Inst::LdRI { vx } => {
-                let i = self.registers.i;
-                for x in 0..=vx {
-                    self.registers
-                        .set_reg_v(x, self.memory[(i + x as u16) as usize]);
+                // Set sound timer value to vx
+                0x18 => {
+                    self.sound_timer = self.registers.get_reg_v(b as u8);
+                    self.pc += 2;
                 }
-                self.registers.i = i + vx as u16 + 1;
-                self.pc += 2;
-            }
+                // Add vx to I
+                0x1E => {
+                    let val = self.registers.i + self.registers.get_reg_v(b as u8) as u16;
+                    self.registers.i = val;
+                    self.pc += 2;
+                }
+                // Set I = location of font char for val of vx
+                0x29 => {
+                    let x = self.registers.get_reg_v(b as u8);
+                    self.registers.i = (FONT_POS_START + 5 * x as usize) as u16;
+                    self.pc += 2;
+                }
+                // Store BCD representation of vx in memory locations pointed to by I, I+1, and I+2
+                0x33 => {
+                    let val = self.registers.get_reg_v(b as u8);
+                    self.memory[self.registers.i as usize] = val / 100;
+                    self.memory[(self.registers.i + 1) as usize] = (val % 100) / 10;
+                    self.memory[(self.registers.i + 2) as usize] = (val % 100) % 10;
+                    self.pc += 2;
+                }
+                // Store registers v0 through vx in memory starting at location I
+                0x55 => {
+                    let i = self.registers.i;
+                    for x in 0..=b as u8 {
+                        self.memory[(i + x as u16) as usize] = self.registers.get_reg_v(x);
+                    }
+                    self.registers.i = i + b as u8 as u16 + 1;
+                    self.pc += 2;
+                }
+                // Read registers V0 through Vx from memory starting at location I
+                0x65 => {
+                    let i = self.registers.i;
+                    for x in 0..=b as u8 {
+                        self.registers
+                            .set_reg_v(x, self.memory[(i + x as u16) as usize]);
+                    }
+                    self.registers.i = i + b as u8 as u16 + 1;
+                    self.pc += 2;
+                }
+                _ => panic!("Illegal instruction {val}"),
+            },
+            _ => panic!("Illegal instruction {val}"),
         }
     }
 

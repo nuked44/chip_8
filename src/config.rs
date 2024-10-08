@@ -6,7 +6,8 @@ pub const SCREEN_WIDTH: u8 = 64;
 pub const SCREEN_HEIGHT: u8 = 32;
 
 // Can change
-pub const INSTRUCTION_TIMING: u64 = 100;
+pub const SCREEN_REFRESH_RATE: usize = 60; // 0>FPS>256
+pub const INSTRUCTION_FREQUENCY: usize = 500; // 0>IPS>n
 
 // --- Keys ---
 
